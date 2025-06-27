@@ -34,6 +34,17 @@ function getAudioDuration(file) {
   });
 }
 
+// Log every incoming request
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] → ${req.method} ${req.url}`);
+  next();
+});
+
+// Simple health check
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
 app.post("/generate-video", async (req, res) => {
   const { images, audioUrl } = req.body;
   if (!Array.isArray(images) || images.length === 0) {
