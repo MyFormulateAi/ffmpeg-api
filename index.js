@@ -15,7 +15,7 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 // configure B2 client
 const b2 = new B2({
   applicationKeyId: process.env.B2_KEY_ID,
-  applicationKey: process.env.B2_APPLICATION_KEY
+  applicationKey:   process.env.B2_APPLICATION_KEY
 });
 
 app.use(express.json({ limit: "50mb" }));
@@ -39,7 +39,7 @@ function getAudioDuration(file) {
   return new Promise((resolve, reject) => {
     const probe = spawn(ffmpegPath, ["-i", file]);
     let stderr = "";
-    probe.stderr.on("data", d => stderr += d.toString());
+    probe.stderr.on("data", d => (stderr += d.toString()));
     probe.on("exit", () => {
       const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
       if (!m) return reject(new Error("Could not parse audio duration"));
@@ -60,9 +60,9 @@ app.post("/generate-video", async (req, res) => {
   }
 
   // temp file paths
-  const tmpDir = __dirname;
-  const audioFile = path.join(tmpDir, "audio.mp3");
-  const imgFiles = images.map((_, i) => path.join(tmpDir, `img${i}.jpg`));
+  const tmpDir     = __dirname;
+  const audioFile  = path.join(tmpDir, "audio.mp3");
+  const imgFiles   = images.map((_, i) => path.join(tmpDir, `img${i}.jpg`));
   const concatFile = path.join(tmpDir, "ffmpeg_input.txt");
   const outputFile = path.join(tmpDir, "output.mp4");
 
@@ -80,7 +80,7 @@ app.post("/generate-video", async (req, res) => {
       `\nfile '${imgFiles[imgFiles.length - 1]}'\n`;
     fs.writeFileSync(concatFile, listTxt);
 
-    // 3) Run ffmpeg
+    // 3) Run ffmpeg to produce output.mp4
     await new Promise((resolve, reject) => {
       const ff = spawn(ffmpegPath, [
         "-y",
@@ -95,35 +95,44 @@ app.post("/generate-video", async (req, res) => {
       ]);
       ff.stderr.on("data", d => process.stdout.write(d.toString()));
       ff.on("error", reject);
-      ff.on("exit", code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`)));
+      ff.on("exit", code => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))));
     });
 
     // 4) Upload to B2
-    await b2.authorize();
-    const uploadUrlRes = await b2.getUploadUrl({ bucketId: process.env.B2_BUCKET_ID });
-    const fileName = `videos/${uuidv4()}.mp4`;
-    const buffer = fs.readFileSync(outputFile);
+    //    a) authorize to get downloadUrl
+    const authRes    = await b2.authorize();
+    const downloadUrl = authRes.data.downloadUrl;  // e.g. "https://f002.backblazeb2.com"
+    console.log("B2 downloadUrl:", downloadUrl);
+    console.log("B2 bucketName :", process.env.B2_BUCKET_NAME);
 
+    //    b) get an upload URL
+    const uploadUrlRes = await b2.getUploadUrl({ bucketId: process.env.B2_BUCKET_ID });
+
+    //    c) upload the file
+    const fileName = `videos/${uuidv4()}.mp4`;
+    const buffer   = fs.readFileSync(outputFile);
     await b2.uploadFile({
-      uploadUrl: uploadUrlRes.data.uploadUrl,
+      uploadUrl:       uploadUrlRes.data.uploadUrl,
       uploadAuthToken: uploadUrlRes.data.authorizationToken,
       fileName,
-      data: buffer
+      data:            buffer
     });
 
-    const publicUrl = `https://${uploadUrlRes.data.bucketEndpoint}/file/${process.env.B2_BUCKET_ID}:${fileName}`;
+    //    d) build the public URL
+    const publicUrl = `${downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}`;
+    console.log("Public URL:", publicUrl);
 
-    // 5) Clean up
+    // 5) Clean up temp files
     fs.unlinkSync(audioFile);
     fs.unlinkSync(concatFile);
     fs.unlinkSync(outputFile);
     imgFiles.forEach(f => fs.unlinkSync(f));
 
-    // 6) Return the public URL
+    // 6) Return the URL
     res.json({ status: "success", videoUrl: publicUrl });
   } catch (err) {
     console.error(err);
-    // attempt cleanup if things failed
+    // cleanup on error
     [audioFile, concatFile, outputFile, ...imgFiles]
       .forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
     res.status(500).json({ error: err.message });
