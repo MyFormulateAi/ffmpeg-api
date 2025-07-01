@@ -1,3 +1,5 @@
+// index.js
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -39,7 +41,7 @@ function getAudioDuration(file) {
   return new Promise((resolve, reject) => {
     const probe = spawn(ffmpegPath, ["-i", file]);
     let stderr = "";
-    probe.stderr.on("data", d => (stderr += d.toString()));
+    probe.stderr.on("data", d => stderr += d.toString());
     probe.on("exit", () => {
       const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
       if (!m) return reject(new Error("Could not parse audio duration"));
@@ -80,36 +82,35 @@ app.post("/generate-video", async (req, res) => {
       `\nfile '${imgFiles[imgFiles.length - 1]}'\n`;
     fs.writeFileSync(concatFile, listTxt);
 
-    // 3) Run ffmpeg to produce output.mp4
+    // 3) Run ffmpeg to produce a 9:16 (1080x1920) portrait video
     await new Promise((resolve, reject) => {
       const ff = spawn(ffmpegPath, [
         "-y",
-        "-f", "concat", "-safe", "0", "-i", concatFile,
-        "-i", audioFile,
-        "-vsync", "vfr",
+        "-f",    "concat", "-safe", "0", "-i", concatFile,
+        "-i",    audioFile,
+        // scale to 1080 wide, pad to 1080x1920 centered (portrait)
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-c:v",  "libx264",
+        "-c:a",  "aac",
         "-pix_fmt", "yuv420p",
-        "-c:v", "libx264",
-        "-c:a", "aac",
         outputFile
       ]);
+
       ff.stderr.on("data", d => process.stdout.write(d.toString()));
       ff.on("error", reject);
-      ff.on("exit", code => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))));
+      ff.on("exit", code => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg exited ${code}`));
+      });
     });
 
     // 4) Upload to B2
-    //    a) authorize to get downloadUrl
-    const authRes    = await b2.authorize();
-    const downloadUrl = authRes.data.downloadUrl;  // e.g. "https://f002.backblazeb2.com"
-    console.log("B2 downloadUrl:", downloadUrl);
-    console.log("B2 bucketName :", process.env.B2_BUCKET_NAME);
-
-    //    b) get an upload URL
+    const authRes     = await b2.authorize();
+    const downloadUrl = authRes.data.downloadUrl;
     const uploadUrlRes = await b2.getUploadUrl({ bucketId: process.env.B2_BUCKET_ID });
+    const fileName    = `videos/${uuidv4()}.mp4`;
+    const buffer      = fs.readFileSync(outputFile);
 
-    //    c) upload the file
-    const fileName = `videos/${uuidv4()}.mp4`;
-    const buffer   = fs.readFileSync(outputFile);
     await b2.uploadFile({
       uploadUrl:       uploadUrlRes.data.uploadUrl,
       uploadAuthToken: uploadUrlRes.data.authorizationToken,
@@ -117,18 +118,15 @@ app.post("/generate-video", async (req, res) => {
       data:            buffer
     });
 
-    //    d) build the public URL
     const publicUrl = `${downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}`;
-    console.log("Public URL:", publicUrl);
 
     // 5) Clean up temp files
-    fs.unlinkSync(audioFile);
-    fs.unlinkSync(concatFile);
-    fs.unlinkSync(outputFile);
-    imgFiles.forEach(f => fs.unlinkSync(f));
+    [audioFile, concatFile, outputFile, ...imgFiles]
+      .forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
 
     // 6) Return the URL
     res.json({ status: "success", videoUrl: publicUrl });
+
   } catch (err) {
     console.error(err);
     // cleanup on error
