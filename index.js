@@ -90,7 +90,6 @@ app.post("/generate-video", async (req, res) => {
         "-pix_fmt", "yuv420p",
         "-c:v", "libx264",
         "-c:a", "aac",
-        "-shortest",
         outputFile
       ]);
       ff.stderr.on("data", d => process.stdout.write(d.toString()));
