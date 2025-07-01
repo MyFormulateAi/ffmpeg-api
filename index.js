@@ -88,11 +88,11 @@ app.post("/generate-video", async (req, res) => {
         "-y",
         "-f",    "concat", "-safe", "0", "-i", concatFile,
         "-i",    audioFile,
-        // scale to 1080 wide, pad to 1080x1920 centered (portrait)
         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
         "-c:v",  "libx264",
         "-c:a",  "aac",
         "-pix_fmt", "yuv420p",
+        "-t",    duration.toFixed(3),
         outputFile
       ]);
 
