@@ -1,5 +1,3 @@
-// index.js
-
 const express = require("express");
 const fs = require("fs");
 const os = require("os");
@@ -9,6 +7,7 @@ const { spawn } = require("child_process");
 const { pipeline } = require("stream");
 const { promisify } = require("util");
 const ffmpegPath = require("ffmpeg-static");
+const pidusage = require("pidusage");
 const B2 = require("backblaze-b2");
 const { v4: uuidv4 } = require("uuid");
 
@@ -16,7 +15,6 @@ const streamPipeline = promisify(pipeline);
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
-// simple memory logger
 function logMem(stage) {
   const m = process.memoryUsage();
   console.log(
@@ -24,19 +22,12 @@ function logMem(stage) {
   );
 }
 
-// configure B2 client
 const b2 = new B2({
   applicationKeyId: process.env.B2_KEY_ID,
   applicationKey:   process.env.B2_APPLICATION_KEY
 });
 
 app.use(express.json({ limit: "50mb" }));
-app.use(express.static(__dirname));
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] → ${req.method} ${req.url}`);
-  next();
-});
-app.get("/health", (_req, res) => res.json({ ok: true }));
 
 async function downloadFile(url, dest) {
   const res = await fetch(url);
@@ -83,14 +74,14 @@ app.post("/generate-video", async (req, res) => {
   const outputFile = path.join(tmpDir, "output.mp4");
 
   try {
-    // download assets
+    // 1) download audio & images
     await downloadFile(audioUrl, audioFile);
     for (let i = 0; i < images.length; i++) {
       await downloadFile(images[i], imgFiles[i]);
     }
     logMem("after-downloads");
 
-    // build concat list
+    // 2) build concat list
     const duration = await getAudioDuration(audioFile);
     const perImage = duration / images.length;
     const listTxt = imgFiles
@@ -99,27 +90,62 @@ app.post("/generate-video", async (req, res) => {
     fs.writeFileSync(concatFile, listTxt);
     logMem("after-concat-list");
 
-    // run ffmpeg
+    // 3) run ffmpeg with minimal-memory x264 settings
     logMem("before-ffmpeg");
     await new Promise((resolve, reject) => {
       const ff = spawn(ffmpegPath, [
         "-y",
-        "-f","concat","-safe","0","-i",concatFile,
-        "-i",audioFile,
-        "-vf","scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-        "-c:v","libx264",
-        "-c:a","aac",
+
+        // limit to one thread
+        "-threads", "1",
+
+        // concat and input
+        "-f",    "concat", "-safe", "0", "-i", concatFile,
+        "-i",    audioFile,
+
+        // scale & crop portrait
+        "-vf",   "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+
+        // x264 encode with ultrafast/zerolatency + no bframes/ref
+        "-c:v",  "libx264",
+        "-preset","ultrafast",
+        "-tune",  "zerolatency",
+        "-x264-params","bframes=0:ref=1",
+        "-crf",   "20",
+
+        "-c:a",  "aac",
         "-pix_fmt","yuv420p",
-        "-t",duration.toFixed(3),
+
+        // stop at audio end
+        "-t",    duration.toFixed(3),
+
         outputFile
       ]);
+
+      // poll ffmpeg mem
+      const poll = setInterval(() => {
+        pidusage(ff.pid, (e, stats) => {
+          if (!e) {
+            console.log(
+              `[FFMPEG MEM] rss=${(stats.memory/1024/1024).toFixed(1)}MB cpu=${stats.cpu.toFixed(1)}%`
+            );
+          }
+        });
+      }, 5000);
+
       ff.stderr.on("data", d => process.stdout.write(d.toString()));
-      ff.on("error", reject);
-      ff.on("exit", code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`)));
+      ff.on("error", err => {
+        clearInterval(poll);
+        reject(err);
+      });
+      ff.on("exit", code => {
+        clearInterval(poll);
+        code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`));
+      });
     });
     logMem("after-ffmpeg");
 
-    // upload to B2
+    // 4) upload to B2
     logMem("before-upload");
     const authRes      = await b2.authorize();
     const downloadUrl  = authRes.data.downloadUrl;
@@ -127,8 +153,9 @@ app.post("/generate-video", async (req, res) => {
     const fileName     = `videos/${uuidv4()}.mp4`;
     const sha1         = await computeSHA1(outputFile);
     const stats        = fs.statSync(outputFile);
+
     const uploadResp = await fetch(uploadUrlRes.data.uploadUrl, {
-      method: "POST",
+      method:  "POST",
       headers: {
         Authorization:       uploadUrlRes.data.authorizationToken,
         "X-Bz-File-Name":    encodeURIComponent(fileName),
@@ -142,9 +169,8 @@ app.post("/generate-video", async (req, res) => {
     if (!uploadResp.ok) throw new Error(`B2 upload failed: ${uploadResp.statusText}`);
     logMem("after-upload");
 
+    // cleanup & respond
     const publicUrl = `${downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}`;
-
-    // cleanup
     fs.rmSync(tmpDir, { recursive: true, force: true });
     logMem("after-cleanup");
 
